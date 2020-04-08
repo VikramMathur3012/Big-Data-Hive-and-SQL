@@ -1,0 +1,384 @@
+-- Big Data Injection & Processing - HIVE - NYC Taxi
+-- By Vikram Mathur
+
+-- Adding JAR file
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+-- ************************* LOADING DATA IN TABLE ************************* 
+-- Creating External Table - Manually validated column sequence from the csv file.
+create external table if not exists nyc_taxi_ng_vm
+(
+	VendorID int, 
+	tpep_pickup_datetime timestamp,
+	tpep_dropoff_datetime timestamp,
+	Passenger_count int, 
+	Trip_distance double,
+	RateCodeID int, 
+	Store_and_fwd_flag string,  
+	PULocationID int, 
+	DOLocationID int, 
+	payment_type int, 
+	Fare_amount double, 
+	Extra double, 
+	MTA_tax double, 
+	Tip_amount double, 
+	Tolls_amount double, 
+	improvement_surcharge double, 
+	Total_amount double
+)
+row format delimited fields terminated by ','
+location '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="1");
+
+-- Run query on the table to view and validate
+select * from nyc_taxi_ng_vm limit 10;
+
+-- ************************* BASIC DATA QUALITY CHECKS ************************* 
+
+-- 1.  Number of records of each provider
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm group by vendorid;
+-- Observation:
+-- vendorid	no_of_records
+--	2	647183
+--	1	527386
+-- There are 2 vendors / providers in the dataset
+
+-- 2. Validating data consistency and identifying data quality issues
+-- Validating based on pick up dates
+-- Pickup date between 1st November 2017 (including) and 31st December 2017 (including) as valid.
+-- Doing a "select *" just to view the corresponding records in other columns and see if there any pattern
+select * from nyc_taxi_ng_vm where date_format(tpep_pickup_datetime,'yyyy') != '2017' or date_format(tpep_pickup_datetime,'MM') not in ('11','12');
+-- Observation: 14 insconsistent records to be removed.
+-- 6 records of 31st October 2017 are not be considered.
+-- 8 other errorneous records to be removed. Two records for 2008, One for 2009 and 2003 resp. and 4 records for 2018 midnight pick up time which should not be a part of this dataset. These records should be deleted. 
+-- These records were submitted by Vendor 2.
+
+-- Validating based on drop off dates
+-- Drop off between 01st November 2017(including) and 2nd January 2018 (excluding) as valid. Only those entries of 01st Jan 2018 drop off are valid where pickup date is 31st Dec 2017.
+select * from nyc_taxi_ng_vm where date_format(tpep_dropoff_datetime,'yyyyMMdd') < '20171101' or date_format(tpep_dropoff_datetime,'yyyyMMdd') > '20180102' and date_format(tpep_pickup_datetime, 'yyyyMMdd') != '20180101';
+-- Observation: 7 errorneous records to be removed. 
+-- 6 records submitted by Vendor 2. 1 record submitted by Vendor 1.
+
+-- Inconsistent date records have primarily been submitted by Vendor 2.
+
+-- 3. Checking for unsual or errorneous rows in the dataset. Checking which vendor supplying incorrect data. Column wise validation
+-- ~~~~~~~ DATE COLUMNS ~~~~~~~ 
+-- Check for records having dropoff date before pickup.
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where unix_timestamp(tpep_pickup_datetime) > unix_timestamp(tpep_dropoff_datetime) group by vendorid;
+-- Observation: There are 73 such errorneous records that need to be removed.
+--	Vendor 1 reported these records.
+
+-- ~~~~~~~ PASSENGER_COUNT COLUMN ~~~~~~~ 
+-- Checking for number of passengers in a trip
+select passenger_count, count(*) as no_of_trips from nyc_taxi_ng_vm group by passenger_count order by no_of_trips desc;
+-- Observation: There are 6824 trips having passenger count as 0. This is errorneous. These records are to be deleted.
+-- Highest frequency is for 1 passenger_count with 827499 records.
+
+-- Checking for details of trips with passenger_count as 0 - Checking which vendor reported these.
+select vendorid, count(*) as no_of_records from nyc_taxi_ng_vm where passenger_count = 0 group by vendorid;
+-- Observation: 
+-- 	Vendor 1 reported 6813 of these records whereas 
+--	Vendor 2 reported 11 such records
+
+-- ~~~~~~~ RATECODEID COLUMN ~~~~~~~ 
+-- Checking data for RateCodeID
+-- Checking for records outside the data dictionary
+select RatecodeID, count(*) as no_of_records from nyc_taxi_ng_vm group by RatecodeID;
+-- Observation: There are 9 records where the RatecodeID is 99 which is not mentioned in the data dictionary. These records are to be removed.
+
+-- Checking which vendor reported these records
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where ratecodeid not in (1,2,3,4,5,6) group by vendorid;
+-- Observation: 
+--	Vendor 1 reported 8 such records whereas 
+--	Vendor 2 reported 1 such record
+
+-- ~~~~~~~ PAYMENT_TYPE COLUMN ~~~~~~~ 
+-- Checking data for payment_type
+-- Checking for records outside the data dictionary
+select payment_type, count(*) as no_of_records from nyc_taxi_ng_vm group by payment_type;
+-- Observation: All records are for payment_type of 1, 2, 3 or 4. No errorneous records found.
+
+-- Checking for records having payment_type = 3 (No Charge) and having total_amount != 0
+select count(*) from nyc_taxi where payment_type = 3 and total_amount != 0;
+-- Observation: There are records that exists which have an amount charged for a free ride. Based on the TA's response on forum, ignoring such details. https://learn.upgrad.com/v/course/258/question/179158
+
+-- ~~~~~~~ LOCATION ID COLUMNS ~~~~~~~ 
+-- Checking min max values for PULocationID and DOLocationID columns to check for outliers
+select min(PULocationID) as min_PULocationID, max(PULocationID) as max_PULocationID, min(DOLocationID) as min_DOLocationID, max(DOLocationID) as max_DOLocationID from nyc_taxi_ng_vm;
+-- Observation: The min and max values came out as 1 and 265 for both fields. Hence there is valid data in these columns
+
+-- ~~~~~~~ STORE_AND_FWD_FLAG COLUMN ~~~~~~~ 
+-- Checking store_and_fwd_flag values other than data dictionary of Y and N
+select store_and_fwd_flag, count(*) no_of_records from nyc_taxi_ng_vm group by store_and_fwd_flag;
+-- Observation: No such errorneous records exits.
+
+-- ~~~~~~~ TRIP_DISTANCE COLUMN ~~~~~~~ 
+-- Checking data for column trip_distance
+-- Checking if there are any records trip_distance under 0
+select count(*) from nyc_taxi_ng_vm where trip_distance < 0;
+-- Observation: No such errorneous records exits.
+
+-- Checking if there is any trip distance associated but the time of pick up and drop off is the same.
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm 
+where trip_distance > 0 and unix_timestamp(tpep_pickup_datetime) = unix_timestamp(tpep_dropoff_datetime)
+group by vendorid;
+-- Observation: Vendor 2 reported 1035 such records whereas Vendor 1 reported 861 such errorneous records.
+
+-- ~~~~~~~ FARE_AMOUNT COLUMN ~~~~~~~ 
+-- Checking for negative fare amount
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where fare_amount < 0 group by vendorid;
+-- Observation: There are 558 records having negative value.
+-- 	Vendor 2 provided these records.
+
+-- ~~~~~~~ EXTRA COLUMN ~~~~~~~ 
+-- Checking for values of extra charge outside the data dictionary
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where extra not in (0,0.5,1) group by vendorid;
+-- Observation: There are several records having data besides the data dictionary
+--  Vendor 2 provided 3033 records.
+--  Vendor 1 provided 1823 of such records.
+
+-- ~~~~~~~ MTA_TAX COLUMN ~~~~~~~ 
+-- Checking for mta_tax column - As per data dictionary it can have a value of $0.5
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where mta_tax not in (0,0.5) group by vendorid;
+-- Observation: There are records 548 errorneous records
+--	Vendor 2 provided 547 of these records.
+--	Vendor 1 provided 1 of such records.
+
+-- ~~~~~~~ TIP_AMOUNT COLUMN ~~~~~~~ 
+-- Checking for negative tolls amount
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where tip_amount < 0 group by vendorid;
+-- Observation: There are 4 records having negative value.
+-- 	Vendor 2 provided these records.
+
+-- Check if cash payments have a tip_amount
+select * from nyc_taxi_ng_vm where payment_type = 2 and tip_amount > 0;
+-- Observation: No errorneous records found.
+
+-- Checking the different quantiles for tip_amount
+select percentile_approx(tip_amount, array(0.10, 0.25, 0.50, 0.75, 0.90,0.99)), max(tip_amount) as max_tip_amount from nyc_taxi_ng_vm where tip_amount >=0;
+-- Max tip is $450 whereas 99th percentile is $11.71
+-- Doing some EDA, checking for records having tip amounts > than $100 and > than the fare_amount
+select * from nyc_taxi_ng_vm where tip_amount > 100 and tip_amount > fare_amount;
+-- There are 10 such records. On analysis there are records like:
+--      1. trip_distance is 0, but tip_amount is $300.8
+--      2. fare_amount is $2.5, but tip_amount is $450, where the trip_distance is 0
+--  These records seem to be errorneous, but still ignoring them for this exercise as there is no specific business validation.
+
+-- ~~~~~~~ TOLLS_AMOUNT COLUMN ~~~~~~~ 
+-- Checking for negative tolls amount
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where tolls_amount < 0 group by vendorid;
+-- Observation: There are 3 records having negative value.
+-- 	Vendor 2 provided these records.
+
+-- Checking the different quantiles for tolls_amount
+select percentile_approx(tolls_amount, array(0.10, 0.25, 0.50, 0.75, 0.90,0.99)), max(tolls_amount) as max_tolls_amount from nyc_taxi_ng_vm where tolls_amount >=0;
+-- 99th percentile value of tolls_amount is $5.76 and the maximum toll charged in a trip is $895.89 which seems to be errorneous
+-- No conclusive business evidence if these are false entries or not. They seem to be errorneous though
+-- Assumption: Taking no action on these records.
+
+-- Checking if any trip has charged the customer toll_amount where trip_distance was 0.
+select vendorid, count(*) no_of_records from nyc_taxi_data_2 where tolls_amount > 0 and trip_distance = 0 group by vendorid;
+-- There are 340 such records reported by Vendor 2 and 303 such records reported by Vendor 1.
+-- No conclusive business evidence if these are false entries or not. They seem to be errorneous though.
+-- A business case could be that the taxi had to pay toll while coming to pickup at a remote location.
+-- Assumption: Taking no action on these records.
+
+-- ~~~~~~~ IMPROVEMENT_SURCHARGE COLUMN ~~~~~~~ 
+-- Checking for improvement_surcharge - As per data dictionary it can have a value of $0.3
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where improvement_surcharge not in (0,0.3) group by vendorid;
+-- Observation: There are 562 such errorneous records.
+--	Vendor 2 provided these records.
+
+-- ~~~~~~~ TOTAL_AMOUNT COLUMN ~~~~~~~ 
+-- Checking for negative total amount
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where total_amount < 0 group by vendorid;
+-- Observation: There are 558 records having negative value.
+-- 	Vendor 2 provided these records.
+
+-- Outlier Analysis on total_amount
+-- Checking for min and max total_amount
+select min(total_amount) as min_total_amount, max(total_amount) as max_total_amount from nyc_taxi_ng_vm;
+-- Observation: The min amount is -200.8 and max amount is 928.19. Both of these seem out of bounds.
+-- Checking the different quantiles for total_amount
+select percentile_approx(total_amount, array(0.10, 0.25, 0.50, 0.75, 0.90,0.99)) from nyc_taxi_ng_vm
+-- Checking for records more than then 99th percentile value of $70.266
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where total_amount > 70.266 group by vendorid;
+-- There are 13,855 such records. Some records could be valid in case of trip_distance or in case of certain pick up and drop off locations
+-- Checking if the trip distance is 0 and the total_amount is more than the 99th percentile value
+select vendorid, count(*) no_of_records from nyc_taxi_ng_vm where total_amount > 70.266 and trip_distance = 0 group by vendorid;
+-- There are 660 such records reported by Vendor 2 and 214 such records reported by Vendor 1.
+-- No conclusive business evidence if these are false entries or not. 
+-- They certainly seem to be errorneous though.
+-- Taking no action on these records and ignoring them.
+
+-- Checking for any calculation error
+select * from nyc_taxi_ng_vm where fare_amount + extra + mta_tax + tip_amount + improvement_surcharge != total_amount;
+-- Observation: There are over 200k records. As confirmed by TA (https://learn.upgrad.com/v/course/258/question/179127/answer/789320) we don't need to consider this assumption and can be ignored. One of the reasons is that the problem statement clearly states that the tip amount in cash will not get reflected in the records.
+
+-- Conclusion on which vendor provided most errorneous records.
+-- Both Vendor 1 and Vendor 2 provided a lot of errorneous records. However, it was VENDOR 2 who seem to provide more errorneous records than Vendor 1.
+-- Vendor 2 provided errorneous records related to amounts and date inconsistency (fact columns) whereas Vendor 1 provided errorneous records related to dimension fields. Following is a quick summary of errorneous records reported by which vendor.
+-- 	Date Inconsistent Records - Vendor 2
+-- 	Drop off Date more than Pick up Date - Vendor 1
+-- 	Zero Passenger Count - Vendor 1
+-- 	Rate Code - Out of Range - Vendor 1
+-- 	Negative Amounts (fare_amount, tip_amount, tolls_amount, total_amount) - Vendor 2
+-- 	Extra - Out of Range - Vendor 2 and Vendor 1
+-- 	mta_tax - Out of Range - Vendor 2
+-- 	Improvement Surcharge - Out of Range - Vendor 2
+
+-- ************************* DATA PREPARATION ************************* 
+-- ************************* PARTITIONING ************************* 
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+drop table nyc_taxi_ng_vm_year_month_partitioned;
+
+create table nyc_taxi_ng_vm_year_month_partitioned
+(
+	VendorID int, 
+	tpep_pickup_datetime timestamp,
+	tpep_dropoff_datetime timestamp,
+	Passenger_count int, 
+	Trip_distance double,
+	RateCodeID int, 
+	Store_and_fwd_flag string,  
+	PULocationID int, 
+	DOLocationID int, 
+	payment_type int, 
+	Fare_amount double, 
+	Extra double, 
+	MTA_tax double, 
+	Tip_amount double, 
+	Tolls_amount double, 
+	improvement_surcharge double, 
+	Total_amount double
+)
+partitioned by (yr int, mnth int)
+stored as orc
+location '/user/hive/warehouse/nyc_taxi_ng_vm'
+tblproperties ("orc.compress"="SNAPPY");
+
+-- ************************* DATA FILTRATION ************************* 
+
+insert overwrite table nyc_taxi_ng_vm_year_month_partitioned partition(yr, mnth)
+select vendorid, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count, trip_distance, ratecodeid, store_and_fwd_flag, pulocationid, dolocationid, payment_type, fare_amount, extra, mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount, 
+date_format(tpep_pickup_datetime,'yyyy') as yr, date_format(tpep_pickup_datetime,'MM') as mnth 
+from nyc_taxi_ng_vm
+where
+date_format(tpep_pickup_datetime,'yyyy') = '2017' 
+and date_format(tpep_pickup_datetime,'MM') in ('11','12')
+and date_format(tpep_dropoff_datetime,'yyyyMMdd') >= '20171101'
+and date_format(tpep_dropoff_datetime,'yyyyMMdd') < '20180102'
+and unix_timestamp(tpep_pickup_datetime) < unix_timestamp(tpep_dropoff_datetime)
+and passenger_count > 0
+and trip_distance >=0
+and ratecodeid in (1,2,3,4,5,6)
+and payment_type in (1,2,3,4,5,6)
+and store_and_fwd_flag in ('Y', 'N')
+and fare_amount >= 0
+and extra in (0, 0.5, 1)
+and mta_tax in (0, 0.5)
+and improvement_surcharge in (0, 0.3)
+and tip_amount >= 0
+and tolls_amount >= 0
+and total_amount >= 0;
+
+
+-- ************************* ANALYSIS 1 ************************* 
+
+-- 1. Compare the overall average fare per trip for November and December.
+select mnth, round(avg(fare_amount),2) avg_fare_per_trip from nyc_taxi_ng_vm_year_month_partitioned group by mnth;
+-- Observation: 
+-- 	mnth	avg_fare_per_trip
+--	11	12.92
+--	12	12.71
+-- The average fare for November and December is quite the same.
+
+-- 2. Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? Do most people travel solo or with other people?
+select passenger_count, count(*) as no_of_trips from nyc_taxi_ng_vm_year_month_partitioned group by passenger_count order by passenger_count;
+-- Observation: 
+-- 	passenger_count	no_of_trips
+--		1	819237
+--		2	175135
+--		3	50270
+--		4	24735
+--		5	54128
+--		6	32916
+--		7	4
+--		8	2
+-- Most people prefer travelling solo. Number of trips having only 1 passenger is 819237.
+
+-- 3. Which is the most preferred mode of payment?
+select payment_type, count(*) no_of_records from nyc_taxi_ng_vm_year_month_partitioned group by payment_type order by no_of_records desc;
+-- Observation: 
+--  	payment_type	no_of_records
+--		1	780260
+--		2	369826
+--		3	4952
+--		4	1389
+-- The most preferred mode of payment is 1, which is Credit Card. It has 780260 records
+
+-- 4. What is the average tip paid per trip? Compare the average tip with the 25th, 50th and 75th percentiles and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’.
+select round(avg(tip_amount),2) as avg_tip_amount, percentile_approx(tip_amount, array(0.25, 0.50, 0.75)) as quantile_tip_amount from nyc_taxi_ng_vm_year_month_partitioned;
+-- Observation: 
+-- 	avg_tip_amount	quantile_tip_amount
+--	1.83		[0.0,1.3541482414404329,2.447993482309125]
+-- The avg_tip_amount is $1.83. Upon comparing with 25th, 50th and 75th percentile we can conclude it is a little greater than then central tendency, but close. (50th percentile of $1.35) and lesser than 75th percentile ($2.45)
+
+-- 5. Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+select round((sum(if(extra>0,1,0))/count(*))*100,2) as fraction_of_trips_with_extra from nyc_taxi_ng_vm_year_month_partitioned;
+--Observation: 46.11% trips have an extra charge levied.
+
+
+-- ************************* ANALYSIS 2 ************************* 
+-- 1. What is the correlation between the number of passengers on any given trip, and the tip paid per trip? Do multiple travellers tip more compared to solo travellers?
+select round(corr(tip_amount, passenger_count),4) from nyc_taxi_ng_vm_year_month_partitioned; 
+-- Observation: The correlation is: -0.0051. This suggests there is no correlation.
+-- With a very slight negative correlation, it would suggest solo travellers tip just a marginally higher than multiple travellers.
+
+-- 2. Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. Calculate the percentage share of each bucket
+select round((sum(if(tip_amount >=0 and tip_amount < 5,1,0))/count(*))*100,2) `[0-5)`,
+    round((sum(if(tip_amount >=5 and tip_amount < 10,1,0))/count(*))*100,2) `[5-10)`,
+    round((sum(if(tip_amount >=10 and tip_amount < 15,1,0))/count(*))*100,2) `[10-15)`,
+    round((sum(if(tip_amount >=15 and tip_amount < 20,1,0))/count(*))*100,2) `[15-20)`,
+    round((sum(if(tip_amount >=20,1,0))/count(*))*100,2) `>=20`
+from nyc_taxi_ng_vm_year_month_partitioned; 
+-- Observation: 
+-- 	[0-5)	[5-10)	[10-15)	[15-20)	>=20
+--	92.39	5.63	1.7	0.19	0.09
+-- Highest percentage is in [0-5) bucket of 92.39%
+
+-- 3. Which month has a greater average ‘speed’ - November or December?
+select mnth, round(avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)),2) as `avg_speed(miles_per_hr)`
+from nyc_taxi_ng_vm_year_month_partitioned
+group by mnth;
+-- Observation: 
+-- 	mnth	avg_speed(miles_per_hr)
+--	11	10.95
+--	12	11.05
+-- December has a greater average 'speed' by a very small margin
+
+-- 4. Analyse the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) and 25th December (Christmas) and compare it with the overall average. 
+select `20171231_avg_speed(miles_per_hr)`, `20171225_avg_speed(miles_per_hr)`, `201712_avg_speed(miles_per_hr)` from 
+(select round(avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)),2) as `20171231_avg_speed(miles_per_hr)`
+from nyc_taxi_ng_vm_year_month_partitioned where date_format(tpep_pickup_datetime,'yyyyMMdd') = '20171231') a,
+(select round(avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)),2) as `20171225_avg_speed(miles_per_hr)`
+from nyc_taxi_ng_vm_year_month_partitioned where date_format(tpep_pickup_datetime,'yyyyMMdd') = '20171225') b,
+(select round(avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600)),2) as `201712_avg_speed(miles_per_hr)`
+from nyc_taxi_ng_vm_year_month_partitioned where date_format(tpep_pickup_datetime,'yyyyMM') = '201712') c;
+-- Observation: 
+-- 	20171231_avg_speed(miles_per_hr)	20171225_avg_speed(miles_per_hr)	201712_avg_speed(miles_per_hr)
+--		13.21					15.24					11.05
+-- The average speed on happending days of the year was higher than the average speed of the month of December. In particular on Christmas, the average speed was much higher.
+
+-- ************************* ASSUMPTIONS ************************* 
+-- Assumption 1: Fare is to be considered based on pickup date and not dropoff date as confirmed by TA in thread: https://learn.upgrad.com/v/course/258/question/179126/answer/789318/comment/157083. As mentioned in the thread all records 31st Oct 2017 as pickup date and 1st Nov 2017 as dropoff date are to be removed. However, records having pickup date of 31st Dec 2017 and dropoff date of 1st Jan 2018 are to be considered. Filter: filter YEAR(`tpep_pickup_datetime`)= 2017 AND MONTH(`tpep_pickup_datetime`) in (11,12)
+
+-- Assumption 2: There is no formula for Total_Amount explictly specified and hence no data quality check for that. Confirmed by TA on discussion forum: https://learn.upgrad.com/v/course/258/question/179127
+
+-- Assumption 3: No Business Logic validation performed for payment_type=3 (No Charge) or Free Ride, wherein there is a total_amount charged in the dataset. TA confirmed to ignore these details. Thread: https://learn.upgrad.com/v/course/258/question/179158
+
+-- Assumption 4: Performed outlier analysis on various amounts, but not removing the outliers as business conclusive evidence for removal not available.
+
+-- Assumption 5: If Fare Amount is 0, but there is a value for tip, toll or others, these records are not being removed. Ideally they would be errorneous records, but based on limited business understanding we are not assuming this. EDA has been done on these records but actual filtration not done.
